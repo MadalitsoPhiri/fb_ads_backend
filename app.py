@@ -10,10 +10,7 @@ from threading import Lock
 from datetime import datetime, timedelta
 from pytz import timezone
 import re
-
-# Patch eventlet to support asynchronous operations
-import eventlet
-eventlet.monkey_patch()
+import requests
 
 # Flask-related imports
 from flask import Flask, request, jsonify
@@ -47,6 +44,11 @@ upload_tasks = {}
 tasks_lock = Lock()
 process_pids = {}
 canceled_tasks = set()
+CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_PARALLEL_UPLOADS = 10
+VERIFY_TOKEN = "your_secure_random_token"
+FACEBOOK_APP_ID = os.getenv("APP_ID")
+FACEBOOK_APP_SECRET = os.getenv("APP_SECRET")
 
 # Custom Exception for canceled tasks
 class TaskCanceledException(Exception):
@@ -395,32 +397,152 @@ def create_ad_set(campaign_id, folder_name, videos, config, task_id):
         return None
 
 # Helper functions for video and image uploads
-def upload_video(video_file, task_id, config):
+def upload_video_chunked(video_file, task_id, config):
+    check_cancellation(task_id)
+    try:
+        session = requests.Session()
+        headers = {"Authorization": f"Bearer {config['access_token']}"}
+        ad_account_id = config['ad_account_id']
+
+        # Step 1: Initiate upload session
+        init_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
+        init_params = {
+            "upload_phase": "start",
+            "file_size": os.path.getsize(video_file),
+            "access_token": config['access_token']
+        }
+        init_response = session.post(init_endpoint, json=init_params, headers=headers).json()
+        
+        session_id = init_response.get("upload_session_id")
+        video_id = init_response.get("video_id")  # Store video_id from init phase
+        
+        if not session_id or not video_id:
+            raise Exception("Failed to initialize video upload session or missing video ID")
+
+        print(f"Upload session started. Session ID: {session_id}, Video ID: {video_id}")
+
+        # Step 2: Upload chunks in parallel
+        def upload_chunk(start_offset, chunk_data):
+            chunk_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
+            chunk_params = {
+                "upload_phase": "transfer",
+                "start_offset": start_offset,
+                "upload_session_id": session_id,
+                "access_token": config['access_token']
+            }
+            files = {"video_file_chunk": chunk_data}
+            chunk_response = session.post(chunk_endpoint, params=chunk_params, files=files, headers=headers).json()
+            return chunk_response
+
+        with open(video_file, "rb") as f:
+            chunks = []
+            start_offset = 0
+            while True:
+                chunk_data = f.read(CHUNK_SIZE)
+                if not chunk_data:
+                    break
+                chunks.append((start_offset, chunk_data))
+                start_offset += len(chunk_data)
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_UPLOADS) as executor:
+            futures = [executor.submit(upload_chunk, start, data) for start, data in chunks]
+            for future in futures:
+                response = future.result()
+                if "start_offset" in response:
+                    print(f"Uploaded chunk. Next start_offset: {response['start_offset']}")
+
+        # Step 3: Finalize upload
+        finish_params = {
+            "upload_phase": "finish",
+            "upload_session_id": session_id,
+            "access_token": config['access_token']
+        }
+        finish_response = session.post(init_endpoint, data=finish_params, headers=headers).json()
+
+        if finish_response.get("success") is not True:
+            raise Exception(f"Upload failed at finish phase: {finish_response}")
+
+        print(f"Upload completed successfully. Video ID: {video_id}")
+        return video_id  # Return video_id from the init phase
+    except Exception as e:
+        emit_error(task_id, f"Error uploading video: {e}")
+        return None
+
+def upload_video_whole(video_file, task_id, config):
     check_cancellation(task_id)
     try:
         video = AdVideo(parent_id=config['ad_account_id'])
         video[AdVideo.Field.filepath] = video_file
         video.remote_create()
         video_id = video.get_id()
-
-        # Retry logic to ensure the video is ready
-        for retries in range(10):
-            try:
-                ready_video = AdVideo(fbid=video_id).api_get(fields=['status'])
-                if ready_video.get('status', {}).get('video_status', 'unknown') == 'ready':
-                    logging.info(f"Video {video_id} is ready for use.")
-                    return video_id
-            except Exception as retry_error:
-                logging.error(f"Error during retry {retries + 1}: {retry_error}")
-            time.sleep(10)
-
-        logging.error(f"Video {video_id} was not ready after 10 retries.")
-        return None
-
+        print(f"Uploaded small video successfully: {video_id}")
+        return video_id
     except Exception as e:
-        error_msg = f"Error uploading video: {e}"
-        emit_error(task_id, error_msg)
+        emit_error(task_id, f"Error uploading small video: {e}")
         return None
+
+# **Enhanced Polling Function**
+def poll_video_status(video_id, access_token, timeout=600, poll_interval=5):
+    """ Polls the Facebook API until the video is processed or timeout occurs. """
+    session = requests.Session()
+    status_url = f"https://graph-video.facebook.com/v19.0/{video_id}"
+    params = {"fields": "status", "access_token": access_token}
+
+    start_time = time.time()
+    retry_attempts = 1  # For exponential backoff
+
+    while time.time() - start_time < timeout:
+        try:
+            response = session.get(status_url, params=params).json()
+            status = response.get("status", {}).get("video_status", "unknown")
+
+            if status == "ready":
+                print(f"✅ Video {video_id} is ready for use!")
+                return True
+            elif status in ["processing", "uploading"]:
+                print(f"⏳ Video {video_id} still processing... Retrying in {poll_interval} seconds.")
+            else:
+                print(f"Unexpected video status: {status}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Error polling video status: {e}")
+
+        time.sleep(poll_interval)
+        poll_interval = min(30, poll_interval + 5)  # Exponential backoff (max 30s)
+        retry_attempts += 1
+
+    print(f"⚠️ Video {video_id} did not finish processing within {timeout} seconds.")
+    return False
+
+
+# **Final Upload Function**
+def upload_video(video_file, task_id, config):
+    """Uploads a video and polls the Facebook API until processing is complete."""
+    file_size = os.path.getsize(video_file)
+    
+    # Upload video (chunked or whole depending on size)
+    if file_size > CHUNK_SIZE:
+        video_id = upload_video_chunked(video_file, task_id, config)
+    else:
+        video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+
+    if not video_id:
+        print("Failed to upload video")
+        return None
+
+    print(f"⏳ Video {video_id} uploaded. Waiting for processing to complete...")
+
+    # Polling for video processing completion
+    success = poll_video_status(video_id, config['access_token'])
+
+    if success:
+        print(f"✅ Video {video_id} is fully processed and ready to use.")
+        return video_id
+    else:
+        print(f"⚠️ Video {video_id} failed to process in time.")
+        return None
+
 
 def upload_image(image_file, task_id, config):
     check_cancellation(task_id)
@@ -438,7 +560,7 @@ def upload_image(image_file, task_id, config):
 # Function to generate thumbnails for videos
 def generate_thumbnail(video_file, thumbnail_file, task_id):
     check_cancellation(task_id)
-    command = ['ffmpeg', '-i', video_file, '-ss', '00:00:01.000', '-vframes', '1', '-update', '1', thumbnail_file]
+    command = ['ffmpeg', '-i', video_file, '-ss', '00:00:01.000', '-vframes', '1', '-preset', 'ultrafast', '-threads', '4', '-update', '1', thumbnail_file]
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         with tasks_lock:
@@ -939,6 +1061,7 @@ def handle_create_campaign():
 
         config = {
             'ad_account_id': ad_account_id,
+            'access_token': access_token,
             'facebook_page_id': facebook_page_id,
             'headline': request.form.get('headline', 'No More Neuropathic Foot Pain'),
             'link': request.form.get('destination_url', 'https://kyronaclinic.com/pages/review-1'),
@@ -1046,7 +1169,7 @@ def handle_create_campaign():
                                         continue
 
                                     if ad_format == 'Single image or video':
-                                        with ThreadPoolExecutor(max_workers=5) as executor:
+                                        with ThreadPoolExecutor(max_workers=10) as executor:
                                             future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
 
                                             for future in as_completed(future_to_video):
@@ -1082,7 +1205,7 @@ def handle_create_campaign():
                                 continue
 
                             if ad_format == 'Single image or video':
-                                with ThreadPoolExecutor(max_workers=5) as executor:
+                                with ThreadPoolExecutor(max_workers=10) as executor:
                                     future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
 
                                     for future in as_completed(future_to_video):
@@ -1144,7 +1267,7 @@ def handle_create_campaign():
                                         continue
 
                                     if config['ad_format'] == 'Single image or video':
-                                        with ThreadPoolExecutor(max_workers=5) as executor:
+                                        with ThreadPoolExecutor(max_workers=10) as executor:
                                             future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
 
                                             for future in as_completed(future_to_image):
@@ -1180,7 +1303,7 @@ def handle_create_campaign():
                                 continue
 
                             if config['ad_format'] == 'Single image or video':
-                                with ThreadPoolExecutor(max_workers=5) as executor:
+                                with ThreadPoolExecutor(max_workers=10) as executor:
                                     future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
 
                                     for future in as_completed(future_to_image):
@@ -1246,7 +1369,7 @@ def handle_create_campaign():
                                             continue
 
                                         if config['ad_format'] == 'Single image or video':
-                                            with ThreadPoolExecutor(max_workers=5) as executor:
+                                            with ThreadPoolExecutor(max_workers=10) as executor:
                                                 future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
 
                                                 for future in as_completed(future_to_media):
@@ -1285,7 +1408,7 @@ def handle_create_campaign():
                                     continue
 
                                 if config['ad_format'] == 'Single image or video':
-                                    with ThreadPoolExecutor(max_workers=5) as executor:
+                                    with ThreadPoolExecutor(max_workers=10) as executor:
                                         future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
 
                                         for future in as_completed(future_to_media):
