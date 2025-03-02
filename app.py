@@ -33,9 +33,13 @@ from PIL import Image
 
 # Concurrency tools
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from routes import file_upload
+
 
 # Flask app setup
 app = Flask(__name__)
+app.register_blueprint(file_upload, url_prefix='/file_upload')
+
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
@@ -45,7 +49,6 @@ tasks_lock = Lock()
 process_pids = {}
 canceled_tasks = set()
 CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
-MAX_PARALLEL_UPLOADS = 10
 VERIFY_TOKEN = "your_secure_random_token"
 FACEBOOK_APP_ID = os.getenv("APP_ID")
 FACEBOOK_APP_SECRET = os.getenv("APP_SECRET")
@@ -414,42 +417,65 @@ def upload_video_chunked(video_file, task_id, config):
         init_response = session.post(init_endpoint, json=init_params, headers=headers).json()
         
         session_id = init_response.get("upload_session_id")
-        video_id = init_response.get("video_id")  # Store video_id from init phase
+        video_id = init_response.get("video_id")  
         
         if not session_id or not video_id:
             raise Exception("Failed to initialize video upload session or missing video ID")
 
         print(f"Upload session started. Session ID: {session_id}, Video ID: {video_id}")
 
-        # Step 2: Upload chunks in parallel
+        # Step 2: Upload chunks sequentially (NOT in parallel)
         def upload_chunk(start_offset, chunk_data):
-            chunk_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
-            chunk_params = {
-                "upload_phase": "transfer",
-                "start_offset": start_offset,
-                "upload_session_id": session_id,
-                "access_token": config['access_token']
-            }
-            files = {"video_file_chunk": chunk_data}
-            chunk_response = session.post(chunk_endpoint, params=chunk_params, files=files, headers=headers).json()
-            return chunk_response
+            retry_count = 0
+            last_offset = start_offset  # Track offset changes
 
+            while retry_count < 3:
+                try:
+                    time.sleep(0.5)  # Small delay to avoid API overload
+                    chunk_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
+                    chunk_params = {
+                        "upload_phase": "transfer",
+                        "start_offset": start_offset,
+                        "upload_session_id": session_id,
+                        "access_token": config['access_token']
+                    }
+                    files = {"video_file_chunk": chunk_data}
+                    chunk_response = session.post(chunk_endpoint, params=chunk_params, files=files, headers=headers).json()
+                    
+                    if "start_offset" in chunk_response:
+                        next_offset = chunk_response["start_offset"]
+                        print(f"Uploaded chunk. Next start_offset: {next_offset}")
+
+                        # Ensure offset is advancing, otherwise force a reset
+                        if next_offset == last_offset:
+                            raise Exception(f"Upload stalled at offset {last_offset}, retrying...")
+
+                        return next_offset  # Return updated offset for next chunk
+                    else:
+                        raise Exception(f"Chunk upload failed: {chunk_response}")
+
+                except Exception as e:
+                    print(f"Retry {retry_count+1}/{3} for chunk {start_offset} failed: {e}")
+                    retry_count += 1
+                    time.sleep(2 * (2 ** retry_count))  # Exponential backoff
+
+            print(f"Chunk upload failed after {3} retries. Aborting upload.")
+            return None  # Stop the process if a chunk fails permanently
+
+        # Read video file in chunks and upload sequentially
         with open(video_file, "rb") as f:
-            chunks = []
             start_offset = 0
             while True:
                 chunk_data = f.read(CHUNK_SIZE)
                 if not chunk_data:
-                    break
-                chunks.append((start_offset, chunk_data))
-                start_offset += len(chunk_data)
+                    break  # End of file
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_UPLOADS) as executor:
-            futures = [executor.submit(upload_chunk, start, data) for start, data in chunks]
-            for future in futures:
-                response = future.result()
-                if "start_offset" in response:
-                    print(f"Uploaded chunk. Next start_offset: {response['start_offset']}")
+                # Upload chunk and get new offset
+                new_offset = upload_chunk(start_offset, chunk_data)
+                if new_offset is None:
+                    return None  # Stop if a chunk upload fails permanently
+
+                start_offset = new_offset  # Move to next offset
 
         # Step 3: Finalize upload
         finish_params = {
@@ -460,10 +486,13 @@ def upload_video_chunked(video_file, task_id, config):
         finish_response = session.post(init_endpoint, data=finish_params, headers=headers).json()
 
         if finish_response.get("success") is not True:
+            if "session expired" in finish_response.get("error", {}).get("message", "").lower():
+                print("Session expired. Restarting upload...")
+                return upload_video_chunked(video_file, task_id, config)  # Restart upload
             raise Exception(f"Upload failed at finish phase: {finish_response}")
 
         print(f"Upload completed successfully. Video ID: {video_id}")
-        return video_id  # Return video_id from the init phase
+        return video_id  
     except Exception as e:
         emit_error(task_id, f"Error uploading video: {e}")
         return None
@@ -522,10 +551,13 @@ def upload_video(video_file, task_id, config):
     file_size = os.path.getsize(video_file)
     
     # Upload video (chunked or whole depending on size)
-    if file_size > CHUNK_SIZE:
-        video_id = upload_video_chunked(video_file, task_id, config)
-    else:
-        video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+    # if file_size > CHUNK_SIZE:
+    #     video_id = upload_video_chunked(video_file, task_id, config)
+    # else:
+    #     video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+
+    video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+
 
     if not video_id:
         print("Failed to upload video")
@@ -997,7 +1029,7 @@ def handle_create_campaign():
         campaign_id = request.form.get('campaign_id')
         print("campaign id:")
         print(campaign_id)
-        upload_folder = request.files.getlist('uploadFolders')
+        folder_id = request.form.get("folder_id")
         task_id = request.form.get('task_id')
 
         ad_account_id = request.form.get('ad_account_id', 'act_2945173505586523')
@@ -1122,13 +1154,13 @@ def handle_create_campaign():
                 logging.error(f"Failed to create campaign with name {campaign_name}")
                 return jsonify({"error": "Failed to create campaign"}), 500
 
-        temp_dir = tempfile.mkdtemp()
-        for file in upload_folder:
-            file_path = os.path.join(temp_dir, file.filename)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            if not file.filename.startswith('.'):  # Skip hidden files like .DS_Store
-                file.save(file_path)
+        # Construct the full path to the folder
+        temp_dir = os.path.join("temp_uploads", folder_id)
 
+        # Ensure the folder exists
+        if not os.path.exists(temp_dir):
+            return jsonify({"error": f"Folder {folder_id} does not exist"}), 404
+        
         folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
 
         def has_subfolders(folder):
