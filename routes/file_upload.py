@@ -11,7 +11,7 @@ import re
 import requests
 
 # Flask-related imports
-from flask import Flask, Blueprint, request, jsonify
+from flask import Flask, Blueprint, request, jsonify, current_app
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 file_upload = Blueprint("file_upload", __name__)
 
-def emit_error(task_id, message):
+def emit_error(message):
     logging.error(f"Raw error message: {message}")  # Log the full raw message for debugging purposes
 
     # Initialize default title and message
@@ -56,15 +56,20 @@ def emit_error(task_id, message):
         # If JSON is not found, just use the raw message as the fallback
         msg = message
 
+    socketio = current_app.extensions.get('socketio')
+    if socketio:
+        socketio.emit('error', {'title': title, 'message': msg})
+    else:
+        logging.error("SocketIO instance not found in current_app extensions")
+
     # Step 4: Emit the error title and message to the frontend
     socketio.emit('error', {
-        'task_id': task_id,
         'title': title,
         'message': msg
     })
 
     # Emit only the title and message to the frontend
-    socketio.emit('error', {'task_id': task_id, 'title': title, 'message': msg})
+    socketio.emit('error', {'title': title, 'message': msg})
 
 def convert_webp_to_jpeg(webp_file):
     jpeg_file = os.path.splitext(webp_file)[0] + ".jpg"
@@ -107,10 +112,10 @@ def poll_video_status(video_id, access_token, timeout=600, poll_interval=5):
     return False
 
 # **Final Upload Function**
-def upload_video(video_file, task_id, config):
+def upload_video(video_file, ad_account_id, access_token):
     """Uploads a video and polls the Facebook API until processing is complete."""
     try:
-        video = AdVideo(parent_id=config['ad_account_id'])
+        video = AdVideo(parent_id=ad_account_id)
         video[AdVideo.Field.filepath] = video_file
         video.remote_create()
         video_id = video.get_id()
@@ -121,7 +126,7 @@ def upload_video(video_file, task_id, config):
         print(f"⏳ Video {video_id} uploaded. Waiting for processing to complete...")
 
         # Polling for video processing completion
-        success = poll_video_status(video_id, config['access_token'])
+        success = poll_video_status(video_id, access_token)
 
         if success:
             print(f"✅ Video {video_id} is fully processed and ready to use.")
@@ -130,25 +135,37 @@ def upload_video(video_file, task_id, config):
             print(f"⚠️ Video {video_id} failed to process in time.")
             return None
     except Exception as e:
-        emit_error(task_id, f"Error uploading video: {e}")
+        emit_error(f"Error uploading video: {e}")
         return None
 
 
-def upload_image(image_file, task_id, config):
+def upload_image(image_file, ad_account_id):
     try:
-        image = AdImage(parent_id=config['ad_account_id'])
+        image = AdImage(parent_id=ad_account_id)
         image[AdImage.Field.filename] = image_file
         image.remote_create()
         logging.info(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
         return image[AdImage.Field.hash]
     except Exception as e:
         error_msg = f"Error uploading image: {e}"
-        emit_error(task_id, error_msg)
+        emit_error(error_msg)
         return None
 
 @file_upload.route("/upload_creatives", methods=["POST"])
 def upload_creatives():
     """Receives videos & images and uploads them while preserving folder structure."""
+
+    # Get Facebook credentials from request
+    access_token = request.form.get('access_token')
+    ad_account_id = request.form.get('ad_account_id')
+    app_id = request.form.get('app_id')
+    app_secret = request.form.get('app_secret')
+
+    if not access_token or not ad_account_id:
+        return jsonify({"error": "Missing access token or ad account ID"}), 400
+    
+    FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
+
     if 'uploadFolders' not in request.files:
         return jsonify({"error": "No files provided"}), 400
 
@@ -158,7 +175,11 @@ def upload_creatives():
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_file = {}
 
+        # Skip hidden/system files like .DS_Store
         for file in files:
+            if file.filename.startswith('.') or file.filename.lower() in ['.ds_store', 'thumbs.db']:
+                continue  # Skip hidden/system files
+
             folder_name = request.form.get(f"folder[{file.filename}]", "default")  # Extract folder from request
             if folder_name not in uploaded_structure:
                 uploaded_structure[folder_name] = []
@@ -175,34 +196,34 @@ def upload_creatives():
                 
                 # Upload the converted JPEG instead
                 with open(jpeg_path, "rb") as jpeg_file:
-                    future_to_file[executor.submit(upload_image, jpeg_file, FACEBOOK_ACCESS_TOKEN, FACEBOOK_AD_ACCOUNT_ID)] = (folder_name, os.path.basename(jpeg_path), "image")
+                    future_to_file[executor.submit(upload_image, jpeg_file, ad_account_id)] = (folder_name, os.path.basename(jpeg_path), "image")
             
             elif file_ext in ['.jpg', '.jpeg', '.png']:
                 # Upload images directly
-                future_to_file[executor.submit(upload_image, file, FACEBOOK_ACCESS_TOKEN, FACEBOOK_AD_ACCOUNT_ID)] = (folder_name, file.filename, "image")
+                future_to_file[executor.submit(upload_image, file, ad_account_id)] = (folder_name, file.filename, "image")
             
             elif file_ext in ['.mp4', '.mov', '.avi']:
                 # Upload videos
-                future_to_file[executor.submit(upload_video, file, FACEBOOK_ACCESS_TOKEN, FACEBOOK_AD_ACCOUNT_ID)] = (folder_name, file.filename, "video")
+                future_to_file[executor.submit(upload_video, file, ad_account_id, access_token)] = (folder_name, file.filename, "video")
 
         for future in as_completed(future_to_file):
             folder_name, file_name, file_type = future_to_file[future]
             try:
-                media_id, error = future.result()
+                media_id = future.result()
                 if media_id:
                     uploaded_structure[folder_name].append({
                         f"{file_type}_id": media_id, 
                         "file_name": file_name
                     })
                 else:
-                    return jsonify({"error": f"Failed to upload {file_name}: {error}"}), 500
+                    logging.error(f"Failed to upload {file_name}.")
             except Exception as e:
-                return jsonify({"error": f"Exception during upload {file_name}: {str(e)}"}), 500
+                logging.error(f"Exception during upload {file_name}: {str(e)}")
 
     return jsonify({"message": "Upload successful", "media_structure": uploaded_structure}), 200
 
 
 @file_upload.route("/cancel_upload", methods=["POST"])
 def cancel_upload():
-    """Endpoint to cancel an ongoing upload."""
-    pass
+    """ Endpoint to cancel an ongoing upload """
+    return jsonify({"message": "Cancellation feature to be implemented"}), 200
