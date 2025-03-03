@@ -1,3 +1,7 @@
+# Patch eventlet to support asynchronous operations
+import eventlet
+eventlet.monkey_patch()
+
 import logging
 import time
 import json
@@ -35,6 +39,11 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from routes import file_upload
 
+from clean_up import TempFileCleanup
+
+# Initialize cleanup with a 1-hour expiration and 10-minute interval
+temp_cleanup = TempFileCleanup(expiration_time=3600, cleanup_interval=600)
+temp_cleanup.start_cleanup()
 
 # Flask app setup
 app = Flask(__name__)
@@ -1159,7 +1168,9 @@ def handle_create_campaign():
 
         # Ensure the folder exists
         if not os.path.exists(temp_dir):
-            return jsonify({"error": f"Folder {folder_id} does not exist"}), 404
+            return jsonify({"error": f"Upload : {folder_id} no longer exists"}), 404
+
+        os.utime(temp_dir, None)
         
         folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
 
