@@ -23,6 +23,7 @@ from facebook_business.adobjects.adimage import AdImage
 # External libraries
 from tqdm import tqdm
 from PIL import Image
+from io import BytesIO
 
 # Concurrency tools
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,10 +116,19 @@ def poll_video_status(video_id, access_token, timeout=600, poll_interval=5):
 def upload_video(video_file, ad_account_id, access_token):
     """Uploads a video and polls the Facebook API until processing is complete."""
     try:
+        # Ensure the temp directory exists
+        temp_dir = os.path.join(tempfile.gettempdir(), "uploaded_videos")
+        os.makedirs(temp_dir, exist_ok=True) 
+
+        temp_video_path = os.path.join(temp_dir, video_file.filename)
+        video_file.save(temp_video_path)
+
+        # ✅ Pass the actual file path to AdVideo
         video = AdVideo(parent_id=ad_account_id)
-        video[AdVideo.Field.filepath] = video_file
+        video[AdVideo.Field.filepath] = temp_video_path
         video.remote_create()
         video_id = video.get_id()
+
         if not video_id:
             print("Failed to upload video")
             return None
@@ -137,23 +147,45 @@ def upload_video(video_file, ad_account_id, access_token):
     except Exception as e:
         emit_error(f"Error uploading video: {e}")
         return None
+    finally:
+        # Ensure temp file cleanup
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
 
 
 def upload_image(image_file, ad_account_id):
+    """Uploads an image while ensuring a valid file path."""
     try:
+        # Save the file temporarily
+        temp_dir = os.path.join(tempfile.gettempdir(), "uploaded_images")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        temp_image_path = os.path.join(temp_dir, image_file.filename)
+        image_file.save(temp_image_path)
+
+        # ✅ Pass the actual file path to AdImage
         image = AdImage(parent_id=ad_account_id)
-        image[AdImage.Field.filename] = image_file
+        image[AdImage.Field.filename] = temp_image_path
         image.remote_create()
-        logging.info(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
+        
+        logging.info(f"✅ Uploaded image with hash: {image[AdImage.Field.hash]}")
         return image[AdImage.Field.hash]
+    
     except Exception as e:
-        error_msg = f"Error uploading image: {e}"
+        error_msg = f"❌ Error uploading image: {e}"
         emit_error(error_msg)
         return None
+    finally:
+        # Cleanup temp file
+        if os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+
 
 @file_upload.route("/upload_creatives", methods=["POST"])
 def upload_creatives():
     """Receives videos & images and uploads them while preserving folder structure."""
+
+    app = current_app._get_current_object()
 
     # Get Facebook credentials from request
     access_token = request.form.get('access_token')
@@ -169,59 +201,83 @@ def upload_creatives():
     if 'uploadFolders' not in request.files:
         return jsonify({"error": "No files provided"}), 400
 
+    socketio = current_app.extensions.get('socketio')
+
     uploaded_structure = {}
-
     files = request.files.getlist('uploadFolders')
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_file = {}
+    total_files = len(files)  # Total files to be uploaded
+    completed_files = 0  # Track completed uploads
 
-        # Skip hidden/system files like .DS_Store
-        for file in files:
-            if file.filename.startswith('.') or file.filename.lower() in ['.ds_store', 'thumbs.db']:
-                continue  # Skip hidden/system files
+    with app.app_context():
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_file = {}
 
-            folder_name = request.form.get(f"folder[{file.filename}]", "default")  # Extract folder from request
-            if folder_name not in uploaded_structure:
-                uploaded_structure[folder_name] = []
+            # Skip hidden/system files like .DS_Store
+            for file in files:
+                if file.filename.startswith('.') or file.filename.lower() in ['.ds_store', 'thumbs.db']:
+                    continue  # Skip hidden/system files
 
-            file_ext = os.path.splitext(file.filename)[1].lower()
-            if file_ext in ['.webp']:
-                # Convert WebP to JPEG before upload
-                print(f"Converting {file.filename} from WebP to JPEG...")
-                temp_dir = tempfile.gettempdir()
-                webp_path = os.path.join(temp_dir, file.filename)
-                file.save(webp_path)  # Save the uploaded webp file first
+                folder_name = request.form.get(f"folder[{file.filename}]", "default")  # Extract folder from request
+                if folder_name not in uploaded_structure:
+                    uploaded_structure[folder_name] = []
+
+                file_ext = os.path.splitext(file.filename)[1].lower()
+                if file_ext in ['.webp']:
+                    # Convert WebP to JPEG before upload
+                    print(f"Converting {file.filename} from WebP to JPEG...")
+                    temp_dir = tempfile.gettempdir()
+                    webp_path = os.path.join(temp_dir, file.filename)
+                    file.save(webp_path)  # Save the uploaded webp file first
+                    
+                    jpeg_path = convert_webp_to_jpeg(webp_path)  # Convert to JPEG
+                    
+                    # Upload the converted JPEG instead
+                    with open(jpeg_path, "rb") as jpeg_file:
+                        future_to_file[executor.submit(upload_image, jpeg_file, ad_account_id)] = (folder_name, os.path.basename(jpeg_path), "image")
                 
-                jpeg_path = convert_webp_to_jpeg(webp_path)  # Convert to JPEG
+                elif file_ext in ['.jpg', '.jpeg', '.png']:
+                    # Upload images directly
+                    future_to_file[executor.submit(upload_image, file, ad_account_id)] = (folder_name, file.filename, "image")
                 
-                # Upload the converted JPEG instead
-                with open(jpeg_path, "rb") as jpeg_file:
-                    future_to_file[executor.submit(upload_image, jpeg_file, ad_account_id)] = (folder_name, os.path.basename(jpeg_path), "image")
-            
-            elif file_ext in ['.jpg', '.jpeg', '.png']:
-                # Upload images directly
-                future_to_file[executor.submit(upload_image, file, ad_account_id)] = (folder_name, file.filename, "image")
-            
-            elif file_ext in ['.mp4', '.mov', '.avi']:
-                # Upload videos
-                future_to_file[executor.submit(upload_video, file, ad_account_id, access_token)] = (folder_name, file.filename, "video")
+                elif file_ext in ['.mp4', '.mov', '.avi']:
+                    # Upload videos
+                    future_to_file[executor.submit(upload_video, file, ad_account_id, access_token)] = (folder_name, file.filename, "video")
 
-        for future in as_completed(future_to_file):
-            folder_name, file_name, file_type = future_to_file[future]
-            try:
-                media_id = future.result()
-                if media_id:
-                    uploaded_structure[folder_name].append({
-                        f"{file_type}_id": media_id, 
-                        "file_name": file_name
+            for future in as_completed(future_to_file):
+                folder_name, file_name, file_type = future_to_file[future]
+                try:
+                    media_id = future.result()
+                    if media_id:
+                        uploaded_structure[folder_name].append({
+                            f"{file_type}_id": media_id, 
+                            "file_name": file_name
+                        })
+
+                    # **Increment completed file count**
+                    completed_files += 1
+                    progress_percentage = (completed_files / total_files) * 100
+
+                    # **Emit progress update**
+                    socketio.emit('upload_progress', {
+                        "completed_files": completed_files,
+                        "total_files": total_files,
+                        "progress": round(progress_percentage, 2),  
+                        "status": "Uploading"
                     })
-                else:
-                    logging.error(f"Failed to upload {file_name}.")
-            except Exception as e:
-                logging.error(f"Exception during upload {file_name}: {str(e)}")
 
+                except Exception as e:
+                    logging.error(f"Exception during upload {file_name}: {str(e)}")
+
+    # **Emit final success update**
+    with app.app_context():
+        socketio.emit('upload_progress', {
+            "completed_files": completed_files,
+            "total_files": total_files,
+            "progress": 100,
+            "status": "Completed"
+        })
+    
     return jsonify({"message": "Upload successful", "media_structure": uploaded_structure}), 200
-
 
 @file_upload.route("/cancel_upload", methods=["POST"])
 def cancel_upload():
