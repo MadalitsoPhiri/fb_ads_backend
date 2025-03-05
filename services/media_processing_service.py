@@ -117,6 +117,9 @@ def _process_single_ads(app, task_id, ad_set_id, media_files, config, pbar, tota
     with app.app_context():
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_file = {executor.submit(create_ad, app, ad_set_id, file, config, task_id): file for file in media_files}
+            
+            # Track the last update time for emitting progress
+            last_emit_time = time.time()
 
             for future in as_completed(future_to_file):
                 check_cancellation(task_id)  # Check if task was canceled
@@ -132,8 +135,11 @@ def _process_single_ads(app, task_id, ad_set_id, media_files, config, pbar, tota
                 finally:
                     pbar.update(1)
 
-                    # Emit progress update every 0.5 seconds
+                    # Emit progress update every 0.5 seconds (or if it's the last file)
                     current_time = time.time()
-                    if current_time - pbar.last_print_t >= 0.5:
-                        get_socketio().emit('progress', {'task_id': task_id, 'progress': pbar.n / total_media * 100, 'step': f"{pbar.n}/{total_media}"})
-                        pbar.last_print_t = current_time
+                    if current_time - last_emit_time >= 0.5 or pbar.n == total_media:
+                        progress = int((pbar.n / total_media) * 100)
+                        get_socketio().emit('progress', {'task_id': task_id, 'progress': progress, 'step': f"{pbar.n}/{total_media}"})
+                        last_emit_time = current_time  # Update last emit time
+                        time.sleep(0.1)  # Allow event loop time to process emissions
+
