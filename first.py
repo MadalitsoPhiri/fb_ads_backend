@@ -1,4 +1,3 @@
-# !IMPORTANT : Ensure this is the first import
 # Patch eventlet to support asynchronous operations
 import eventlet
 eventlet.monkey_patch()
@@ -40,129 +39,29 @@ from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from routes import file_upload
 
+from clean_up import TempFileCleanup
+
+# Initialize cleanup with a 1-hour expiration and 10-minute interval
+temp_cleanup = TempFileCleanup(expiration_time=3600, cleanup_interval=600)
+temp_cleanup.start_cleanup()
 
 # Flask app setup
 app = Flask(__name__)
+app.register_blueprint(file_upload, url_prefix='/file_upload')
+
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
-app.extensions['socketio'] = socketio  
-app.register_blueprint(file_upload, url_prefix='/file_upload')
 
 # Global variables for tasks and locks
 upload_tasks = {}
 tasks_lock = Lock()
 process_pids = {}
 canceled_tasks = set()
-VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi')
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
+CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
+VERIFY_TOKEN = "your_secure_random_token"
+FACEBOOK_APP_ID = os.getenv("APP_ID")
+FACEBOOK_APP_SECRET = os.getenv("APP_SECRET")
 
-# Custom Exception for canceled tasks
-class TaskCanceledException(Exception):
-    pass
-
-# Utility function to handle error emission through socket
-def emit_error(task_id, message):
-    logging.error(f"Raw error message: {message}")  # Log the full raw message for debugging purposes
-
-    # Initialize default title and message
-    title = "Error"
-    msg = "An unknown error occurred."
-
-    # Step 1: Extract the JSON part from the raw error message using regex
-    json_match = re.search(r'Response:\s*(\{.*\})', message, re.DOTALL)
-    
-    if json_match:
-        # Step 2: Parse the extracted JSON part
-        try:
-            error_data = json.loads(json_match.group(1))
-
-            # Step 3: Extract title and message from the parsed JSON
-            title = error_data.get("error", {}).get("error_user_title", "Error")
-            print("Title\n")
-            print(title)
-            msg = error_data.get("error", {}).get("error_user_msg", "An unknown error occurred.")
-        except json.JSONDecodeError:
-            logging.error("Failed to parse the error JSON from the response.")
-    else:
-        # If JSON is not found, just use the raw message as the fallback
-        msg = message
-
-    # Step 4: Emit the error title and message to the frontend
-    socketio.emit('error', {
-        'task_id': task_id,
-        'title': title,
-        'message': msg
-    })
-
-    # Emit only the title and message to the frontend
-    socketio.emit('error', {'task_id': task_id, 'title': title, 'message': msg})
-
-# Common cancellation check
-def check_cancellation(task_id):
-    with tasks_lock:
-        if task_id in canceled_tasks:
-            canceled_tasks.remove(task_id)
-            raise TaskCanceledException(f"Task {task_id} has been canceled")
-
-#function to check campaign budget optimization.
-def get_campaign_budget_optimization(campaign_id, ad_account_id):
-    try:
-        campaign = Campaign(campaign_id).api_get(fields=[
-            Campaign.Field.name,
-            Campaign.Field.effective_status,
-            Campaign.Field.daily_budget,
-            Campaign.Field.lifetime_budget,
-            Campaign.Field.objective
-
-        ])
-        
-        is_cbo = campaign.get('daily_budget') is not None or campaign.get('lifetime_budget') is not None
-        return {
-            "name": campaign.get('name'),
-            "effective_status": campaign.get('effective_status'),
-            "daily_budget": campaign.get('daily_budget'),
-            "lifetime_budget": campaign.get('lifetime_budget'),
-            "is_campaign_budget_optimization": is_cbo,
-            "objective": campaign.get("objective", "OUTCOME_TRAFFIC"),  # Return the campaign objective
-
-        }
-    except Exception as e:
-        print(f"Error fetching campaign details: {e}")
-        return None
-
-# Function to fetch campaign budget optimization status and return a boolean value
-def is_campaign_budget_optimized(campaign_id, ad_account_id):
-    existing_campaign_budget_optimization = get_campaign_budget_optimization(campaign_id, ad_account_id)
-    return existing_campaign_budget_optimization.get('is_campaign_budget_optimization', False)
-
-# Function to create a campaign
-def create_campaign(name, objective, budget_optimization, budget_value, bid_strategy, buying_type, task_id, ad_account_id, app_id, app_secret, access_token, is_cbo):
-    check_cancellation(task_id)
-    try:
-        FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
-
-        campaign_params = {
-            "name": name,
-            "objective": objective,
-            "special_ad_categories": ["NONE"],
-            "buying_type": buying_type,
-        }
-
-        # Handling Auction Buying type
-        if buying_type == "AUCTION":
-            budget_value_cents = int(float(budget_value) * 100)  # Convert to cents
-            if is_cbo:
-                campaign_params["daily_budget"] = budget_value_cents if budget_optimization == "DAILY_BUDGET" else None
-                campaign_params["lifetime_budget"] = budget_value_cents if budget_optimization == "LIFETIME_BUDGET" else None
-                campaign_params["bid_strategy"] = bid_strategy
-
-        campaign = AdAccount(ad_account_id).create_campaign(fields=[AdAccount.Field.id], params=campaign_params)
-        logging.info(f"Created campaign with ID: {campaign['id']}")
-        return campaign['id'], campaign
-    except Exception as e:
-        error_msg = f"Error creating campaign: {e}"
-        emit_error(task_id, error_msg)
-        return None, None
 
 #fetch ad_account timezone:
 def get_ad_account_timezone(ad_account_id):
@@ -177,7 +76,7 @@ def convert_to_utc(local_time_str, ad_account_timezone):
 
 
 # Function to create an ad set
-def create_ad_set(campaign_id, folder_name, config, task_id):
+def create_ad_set(campaign_id, folder_name, videos, config, task_id):
     check_cancellation(task_id)
     try:
         app_events = config.get('app_events')
@@ -402,6 +301,279 @@ def create_ad_set(campaign_id, folder_name, config, task_id):
         emit_error(task_id, error_msg)
         return None
 
+# Helper functions for video and image uploads
+def upload_video_chunked(video_file, task_id, config):
+    check_cancellation(task_id)
+    try:
+        session = requests.Session()
+        headers = {"Authorization": f"Bearer {config['access_token']}"}
+        ad_account_id = config['ad_account_id']
+
+        # Step 1: Initiate upload session
+        init_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
+        init_params = {
+            "upload_phase": "start",
+            "file_size": os.path.getsize(video_file),
+            "access_token": config['access_token']
+        }
+        init_response = session.post(init_endpoint, json=init_params, headers=headers).json()
+        
+        session_id = init_response.get("upload_session_id")
+        video_id = init_response.get("video_id")  
+        
+        if not session_id or not video_id:
+            raise Exception("Failed to initialize video upload session or missing video ID")
+
+        print(f"Upload session started. Session ID: {session_id}, Video ID: {video_id}")
+
+        # Step 2: Upload chunks sequentially (NOT in parallel)
+        def upload_chunk(start_offset, chunk_data):
+            retry_count = 0
+            last_offset = start_offset  # Track offset changes
+
+            while retry_count < 3:
+                try:
+                    time.sleep(0.5)  # Small delay to avoid API overload
+                    chunk_endpoint = f"https://graph-video.facebook.com/v19.0/{ad_account_id}/advideos"
+                    chunk_params = {
+                        "upload_phase": "transfer",
+                        "start_offset": start_offset,
+                        "upload_session_id": session_id,
+                        "access_token": config['access_token']
+                    }
+                    files = {"video_file_chunk": chunk_data}
+                    chunk_response = session.post(chunk_endpoint, params=chunk_params, files=files, headers=headers).json()
+                    
+                    if "start_offset" in chunk_response:
+                        next_offset = chunk_response["start_offset"]
+                        print(f"Uploaded chunk. Next start_offset: {next_offset}")
+
+                        # Ensure offset is advancing, otherwise force a reset
+                        if next_offset == last_offset:
+                            raise Exception(f"Upload stalled at offset {last_offset}, retrying...")
+
+                        return next_offset  # Return updated offset for next chunk
+                    else:
+                        raise Exception(f"Chunk upload failed: {chunk_response}")
+
+                except Exception as e:
+                    print(f"Retry {retry_count+1}/{3} for chunk {start_offset} failed: {e}")
+                    retry_count += 1
+                    time.sleep(2 * (2 ** retry_count))  # Exponential backoff
+
+            print(f"Chunk upload failed after {3} retries. Aborting upload.")
+            return None  # Stop the process if a chunk fails permanently
+
+        # Read video file in chunks and upload sequentially
+        with open(video_file, "rb") as f:
+            start_offset = 0
+            while True:
+                chunk_data = f.read(CHUNK_SIZE)
+                if not chunk_data:
+                    break  # End of file
+
+                # Upload chunk and get new offset
+                new_offset = upload_chunk(start_offset, chunk_data)
+                if new_offset is None:
+                    return None  # Stop if a chunk upload fails permanently
+
+                start_offset = new_offset  # Move to next offset
+
+        # Step 3: Finalize upload
+        finish_params = {
+            "upload_phase": "finish",
+            "upload_session_id": session_id,
+            "access_token": config['access_token']
+        }
+        finish_response = session.post(init_endpoint, data=finish_params, headers=headers).json()
+
+        if finish_response.get("success") is not True:
+            if "session expired" in finish_response.get("error", {}).get("message", "").lower():
+                print("Session expired. Restarting upload...")
+                return upload_video_chunked(video_file, task_id, config)  # Restart upload
+            raise Exception(f"Upload failed at finish phase: {finish_response}")
+
+        print(f"Upload completed successfully. Video ID: {video_id}")
+        return video_id  
+    except Exception as e:
+        emit_error(task_id, f"Error uploading video: {e}")
+        return None
+
+def upload_video_whole(video_file, task_id, config):
+    check_cancellation(task_id)
+    try:
+        video = AdVideo(parent_id=config['ad_account_id'])
+        video[AdVideo.Field.filepath] = video_file
+        video.remote_create()
+        video_id = video.get_id()
+        print(f"Uploaded small video successfully: {video_id}")
+        return video_id
+    except Exception as e:
+        emit_error(task_id, f"Error uploading small video: {e}")
+        return None
+
+# **Enhanced Polling Function**
+def poll_video_status(video_id, access_token, timeout=600, poll_interval=5):
+    """ Polls the Facebook API until the video is processed or timeout occurs. """
+    session = requests.Session()
+    status_url = f"https://graph-video.facebook.com/v19.0/{video_id}"
+    params = {"fields": "status", "access_token": access_token}
+
+    start_time = time.time()
+    retry_attempts = 1  # For exponential backoff
+
+    while time.time() - start_time < timeout:
+        try:
+            response = session.get(status_url, params=params).json()
+            status = response.get("status", {}).get("video_status", "unknown")
+
+            if status == "ready":
+                print(f"✅ Video {video_id} is ready for use!")
+                return True
+            elif status in ["processing", "uploading"]:
+                print(f"⏳ Video {video_id} still processing... Retrying in {poll_interval} seconds.")
+            else:
+                print(f"Unexpected video status: {status}")
+                return False
+
+        except Exception as e:
+            logging.error(f"Error polling video status: {e}")
+
+        time.sleep(poll_interval)
+        poll_interval = min(30, poll_interval + 5)  # Exponential backoff (max 30s)
+        retry_attempts += 1
+
+    print(f"⚠️ Video {video_id} did not finish processing within {timeout} seconds.")
+    return False
+
+
+# **Final Upload Function**
+def upload_video(video_file, task_id, config):
+    """Uploads a video and polls the Facebook API until processing is complete."""
+    file_size = os.path.getsize(video_file)
+    
+    # Upload video (chunked or whole depending on size)
+    # if file_size > CHUNK_SIZE:
+    #     video_id = upload_video_chunked(video_file, task_id, config)
+    # else:
+    #     video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+
+    video_id = upload_video_whole(video_file, task_id, config)  # You need to define this
+
+
+    if not video_id:
+        print("Failed to upload video")
+        return None
+
+    print(f"⏳ Video {video_id} uploaded. Waiting for processing to complete...")
+
+    # Polling for video processing completion
+    success = poll_video_status(video_id, config['access_token'])
+
+    if success:
+        print(f"✅ Video {video_id} is fully processed and ready to use.")
+        return video_id
+    else:
+        print(f"⚠️ Video {video_id} failed to process in time.")
+        return None
+
+
+def upload_image(image_file, task_id, config):
+    check_cancellation(task_id)
+    try:
+        image = AdImage(parent_id=config['ad_account_id'])
+        image[AdImage.Field.filename] = image_file
+        image.remote_create()
+        logging.info(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
+        return image[AdImage.Field.hash]
+    except Exception as e:
+        error_msg = f"Error uploading image: {e}"
+        emit_error(task_id, error_msg)
+        return None
+
+# Function to generate thumbnails for videos
+def generate_thumbnail(video_file, thumbnail_file, task_id):
+    check_cancellation(task_id)
+    command = ['ffmpeg', '-i', video_file, '-ss', '00:00:01.000', '-vframes', '1', '-preset', 'ultrafast', '-threads', '4', '-update', '1', thumbnail_file]
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            process_pids.setdefault(task_id, []).append(proc.pid)
+        stdout, stderr = proc.communicate()
+
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Error generating thumbnail: {e.cmd} returned non-zero exit status {e.returncode}"
+        emit_error(task_id, error_msg)
+        raise
+
+def get_video_duration(video_file, task_id):
+    check_cancellation(task_id)
+    command = [
+        'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_file
+    ]
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            if task_id not in process_pids:
+                process_pids[task_id] = []
+            process_pids[task_id].append(proc.pid)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+        return float(stdout)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated by signal.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        else:
+            print(f"Error getting video duration: {e.cmd} returned non-zero exit status {e.returncode}")
+            print(f"Stdout: {e.output.decode()}")
+            print(f"Stderr: {e.stderr.decode()}")
+            raise
+
+
+
+def trim_video(input_file, output_file, duration, task_id):
+    check_cancellation(task_id)
+    command = [
+        'ffmpeg',
+        '-i', input_file,
+        '-t', str(duration),
+        '-c', 'copy',
+        output_file
+    ]
+    try:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tasks_lock:
+            if task_id not in process_pids:
+                process_pids[task_id] = []
+            process_pids[task_id].append(proc.pid)
+        stdout, stderr = proc.communicate()
+        if proc.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, command, output=stdout, stderr=stderr)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == -signal.SIGTERM:
+            print(f"Process for task {task_id} was terminated by signal.")
+            raise TaskCanceledException(f"Task {task_id} has been canceled")
+        else:
+            print(f"Error trimming video: {e.cmd} returned non-zero exit status {e.returncode}")
+            print(f"Stdout: {e.output.decode()}")
+            print(f"Stderr: {e.stderr.decode()}")
+            raise
+
 def parse_config(config_text):
     config = {}
     lines = config_text.strip().split('\n')
@@ -410,16 +582,27 @@ def parse_config(config_text):
         config[key.strip()] = value.strip()
     return config
 
-def create_ad(ad_set_id, media_item, config, task_id):
+def convert_webp_to_jpeg(webp_file):
+    jpeg_file = os.path.splitext(webp_file)[0] + ".jpg"
+    with Image.open(webp_file) as img:
+        img.convert("RGB").save(jpeg_file, "JPEG")
+    return jpeg_file
+
+def create_ad(ad_set_id, media_file, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Single image or video')
         if ad_format == 'Single image or video':
-            if media_item["media_file"].lower().endswith(('.jpg', '.png', '.jpeg', '.webp')):
+            if media_file.lower().endswith('.webp'):
+                print("Converting webp to jpeg")
+                media_file = convert_webp_to_jpeg(media_file)
+
+            if media_file.lower().endswith(('.jpg', '.png', '.jpeg')):
+                print("Images")
                 # Image ad logic
-                image_hash = media_item["media_id"]
-                if not media_item.get("media_id"):
-                    print(f"Failed to upload image: {media_item['media_file']}")
+                image_hash = upload_image(media_file, task_id, config)
+                if not image_hash:
+                    print(f"Failed to upload image: {media_file}")
                     return
                 
                 base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
@@ -471,7 +654,7 @@ def create_ad(ad_set_id, media_item, config, task_id):
                 ad_creative.remote_create()
 
                 ad = Ad(parent_id=config['ad_account_id'])
-                ad[Ad.Field.name] = media_item["media_file"]
+                ad[Ad.Field.name] = os.path.splitext(os.path.basename(media_file))[0]
                 ad[Ad.Field.adset_id] = ad_set_id
                 ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
                 ad[Ad.Field.status] = "PAUSED"
@@ -481,13 +664,19 @@ def create_ad(ad_set_id, media_item, config, task_id):
 
             else:
                 # Video ad logic
-                video_id = media_item["media_id"]
-                if not media_item.get("media_id"):
-                    print(f"Failed to upload video: {media_item['media_file']}")
+                video_path = media_file
+                thumbnail_path = f"{os.path.splitext(media_file)[0]}.jpg"
+
+                generate_thumbnail(video_path, thumbnail_path, task_id)
+                image_hash = upload_image(thumbnail_path, task_id, config)
+
+                if not image_hash:
+                    print(f"Failed to upload thumbnail: {thumbnail_path}")
                     return
-                image_hash = media_item["thumbnail_hash"]
-                if not media_item.get("thumbnail_hash"):
-                    print("Failed to upload thumbnail")
+
+                video_id = upload_video(video_path, task_id, config)
+                if not video_id:
+                    print(f"Failed to upload video: {media_file}")
                     return
 
                 base_link = config.get('link', 'https://kyronaclinic.com/pages/review-1')
@@ -540,7 +729,7 @@ def create_ad(ad_set_id, media_item, config, task_id):
                 ad_creative.remote_create()
 
                 ad = Ad(parent_id=config['ad_account_id'])
-                ad[Ad.Field.name] = media_item["media_file"]
+                ad[Ad.Field.name] = os.path.splitext(os.path.basename(media_file))[0]
                 ad[Ad.Field.adset_id] = ad_set_id
                 ad[Ad.Field.creative] = {"creative_id": ad_creative.get_id()}
                 ad[Ad.Field.status] = "PAUSED"
@@ -557,24 +746,33 @@ def create_ad(ad_set_id, media_item, config, task_id):
             error_msg = f"Error creating ad: {e}"
             emit_error(task_id, error_msg)
 
-def create_carousel_ad(ad_set_id, media_items, config, task_id):
+def create_carousel_ad(ad_set_id, media_files, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Carousel')
         if ad_format == 'Carousel':
             carousel_cards = []
 
-            for media_item in media_items:
-                if media_item["media_file"].lower().endswith(('.mp4', '.mov', '.avi')):
+            for media_file in media_files:
+                if media_file.lower().endswith('.webp'):
+                    print("Converting webp to jpeg")
+                    media_file = convert_webp_to_jpeg(media_file)
+
+                if media_file.lower().endswith(('.mp4', '.mov', '.avi')):
                     # Video processing
-                    video_id = media_item["media_id"]
-                    if not media_item.get("media_id"):
-                        print(f"Failed to upload video: {media_item['media_file']}")
+                    video_path = media_file
+                    thumbnail_path = f"{os.path.splitext(media_file)[0]}.jpg"
+
+                    generate_thumbnail(video_path, thumbnail_path, task_id)
+                    image_hash = upload_image(thumbnail_path, task_id, config)
+
+                    if not image_hash:
+                        print(f"Failed to upload thumbnail: {thumbnail_path}")
                         return
-                    image_hash = media_item["thumbnail_hash"]
-                    print(media_item.get("thumbnail_hash"))
-                    if not media_item.get("thumbnail_hash"):
-                        print("Failed to upload thumbnail")
+
+                    video_id = upload_video(video_path, task_id, config)
+                    if not video_id:
+                        print(f"Failed to upload video: {media_file}")
                         return
 
                     card = {
@@ -589,11 +787,11 @@ def create_carousel_ad(ad_set_id, media_items, config, task_id):
                         "image_hash": image_hash
                     }
 
-                elif media_item["media_file"].lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                elif media_file.lower().endswith(('.jpg', '.jpeg', '.png')):
                     # Image processing
-                    image_hash = media_item["media_id"]
-                    if not media_item.get("media_id"):
-                        print(f"Failed to upload image: {media_item['media_file']}")
+                    image_hash = upload_image(media_file, task_id, config)
+                    if not image_hash:
+                        print(f"Failed to upload image: {media_file}")
                         return
 
                     card = {
@@ -608,7 +806,7 @@ def create_carousel_ad(ad_set_id, media_items, config, task_id):
                     }
 
                 else:
-                    print(f"Unsupported media file format: {media_item['media_file']}")
+                    print(f"Unsupported media file format: {media_file}")
                     continue
 
                 # Add UTM parameters if provided
@@ -670,37 +868,22 @@ def create_carousel_ad(ad_set_id, media_items, config, task_id):
             error_msg = f"Error creating carousel ad: {e}"
             emit_error(task_id, error_msg)
             
-def find_campaign_by_id(campaign_id, ad_account_id):
-    try:
-        campaign = AdAccount(ad_account_id).get_campaigns(
-            fields=['name'],
-            params={
-                'filtering': [{'field': 'id', 'operator': 'EQUAL', 'value': campaign_id}]
-            }
-        )
-        if campaign:
-            return campaign_id
-        else:
-            return None
-    except Exception as e:
-        print(f"Error finding campaign by ID: {e}")
-        return None
 
-def get_video_count(folder_structure):
-    """Returns the total number of video files in the folder structure."""
-    return sum(
-        1 for media_list in folder_structure.values() 
-        for media in media_list 
-        if os.path.splitext(media["file_name"])[1].lower() in VIDEO_EXTENSIONS
-    )
+def get_all_video_files(directory):
+    video_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.mp4', '.mov', '.avi')):
+                video_files.append(os.path.join(root, file))
+    return video_files
 
-def get_image_count(folder_structure):
-    """Returns the total number of image files in the folder structure."""
-    return sum(
-        1 for media_list in folder_structure.values() 
-        for media in media_list 
-        if os.path.splitext(media["file_name"])[1].lower() in IMAGE_EXTENSIONS
-    )
+def get_all_image_files(directory):
+    image_files = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                image_files.append(os.path.join(root, file))
+    return image_files
 
 @app.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
@@ -755,22 +938,7 @@ def handle_create_campaign():
         object_store_url = request.form.get('object_store_url', '')
         bid_amount = request.form.get('bid_amount', '0.0')
         is_cbo = request.form.get('isCBO', 'false').lower() == 'true'
-
-        folder_structure_json = request.form.get('folderStructure')
-
-        if not folder_structure_json:
-            logging.error("No folder structure received.")
-            return jsonify({"error": "No folder structure provided"}), 400
-
-        try:
-            folder_structure = json.loads(folder_structure_json)
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding folder structure JSON: {e}")
-            logging.error(f"Received folder structure: {folder_structure_json}")  # Log exact value received
-            return jsonify({"error": "Invalid folder structure JSON"}), 400
-
-        print(folder_structure)
-
+        
         # Receive the JavaScript objects directly
         if request.is_json:
             platforms = request.json.get('platforms', '{}')
@@ -873,167 +1041,116 @@ def handle_create_campaign():
                 logging.error(f"Failed to create campaign with name {campaign_name}")
                 return jsonify({"error": "Failed to create campaign"}), 500
 
+        # Construct the full path to the folder
+        temp_dir = os.path.join("temp_uploads", folder_id)
+
+        # Ensure the folder exists
+        if not os.path.exists(temp_dir):
+            return jsonify({"error": f"Upload : {folder_id} no longer exists"}), 404
+
+        os.utime(temp_dir, None)
         
-        def has_subfolders(folder_structure):
-            """
-            Determines if the folder structure contains subfolders.
+        folders = [f for f in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, f))]
 
-            Args:
-                folder_structure (dict): The entire folder structure containing media files.
+        def has_subfolders(folder):
+            for item in os.listdir(folder):
+                item_path = os.path.join(folder, item)
+                if os.path.isdir(item_path):
+                    return True
+            return False
 
-            Returns:
-                bool: True if there are multiple folders inside a common parent, False otherwise.
-            """
-            all_folder_paths = set()
+        total_videos = 0
+        total_images = 0
+        for folder in folders:
+            folder_path = os.path.join(temp_dir, folder)
+            total_videos += len(get_all_video_files(folder_path))
+            total_images += len(get_all_image_files(folder_path))
 
-            for media_list in folder_structure.values():
-                for media in media_list:
-                    file_path = media["file_name"]
-                    folder_path = os.path.normpath(os.path.dirname(file_path))  
-                    all_folder_paths.add(folder_path)
-
-            sorted_folders = sorted(all_folder_paths)
-            print(sorted_folders)  # Debugging output
-
-            # If there's more than 1 folder, we have subfolders inside a common parent
-            return len(sorted_folders) > 1
-
-        def get_subfolder_media_mapping(folder_structure):
-            """
-            Extracts a mapping of subfolder names to their corresponding media IDs, file names, and thumbnail hashes.
-
-            Args:
-                folder_structure (dict): The folder structure with media files.
-
-            Returns:
-                dict: A dictionary where keys are subfolder names and values are lists of dictionaries 
-                    containing media_id, precise file_name, and thumbnail_hash.
-            """
-            subfolder_mapping = {}
-
-            for media_list in folder_structure.values():
-                for media in media_list:
-                    file_path = media["file_name"]
-                    media_id = media["media_id"]
-                    thumbnail_hash = media.get("thumbnail_hash", "")  # ✅ Ensure thumbnail hash is included (if available)
-
-                    # Extract subfolder name (excluding root folder)
-                    folder_path = os.path.normpath(os.path.dirname(file_path))
-                    subfolder_name = folder_path.split(os.sep)[-1]  # Get the last folder name
-
-                    # Extract only the file name (no folder paths)
-                    media_file = os.path.basename(file_path)
-
-                    # Add media ID, cleaned file name, and thumbnail hash under the corresponding subfolder
-                    if subfolder_name:  # Ensure it's not an empty string
-                        subfolder_mapping.setdefault(subfolder_name, []).append({
-                            "media_id": media_id,
-                            "media_file": media_file,  # Only the filename (e.g., "03.mp4")
-                            "thumbnail_hash": thumbnail_hash  #includes thumbnail hash for videos
-                        })
-
-            return subfolder_mapping
-        
-        total_videos = get_video_count(folder_structure)
-        total_images = get_image_count(folder_structure)
-        total = total_images + total_videos
-
-        subfolder_mapping = get_subfolder_media_mapping(folder_structure)
-
-        def process_media(task_id, campaign_id, folder_structure, config, total):
+        def process_videos(task_id, campaign_id, folders, config, total_videos):
             try:
-                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total}"})
+                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_videos}"})
                 processed_videos = 0
 
-                with tqdm(total, desc="Processing videos") as pbar:
+                with tqdm(total=total_videos, desc="Processing videos") as pbar:
                     last_update_time = time.time()
-                    check_cancellation(task_id)
+                    for folder in folders:
+                        check_cancellation(task_id)
+                        folder_path = os.path.join(temp_dir, folder)
 
-                    if has_subfolders(folder_structure):
-                        for subfolder, media_items in subfolder_mapping.items():
-                            if not media_items:
+                        if has_subfolders(folder_path):
+                            for subfolder in os.listdir(folder_path):
+                                subfolder_path = os.path.join(folder_path, subfolder)
+                                if os.path.isdir(subfolder_path):
+                                    video_files = get_all_video_files(subfolder_path)
+                                    if not video_files:
+                                        continue
+
+                                    ad_set = create_ad_set(campaign_id, subfolder, video_files, config, task_id)
+                                    if not ad_set:
+                                        continue
+
+                                    if ad_format == 'Single image or video':
+                                        with ThreadPoolExecutor(max_workers=10) as executor:
+                                            future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
+
+                                            for future in as_completed(future_to_video):
+                                                check_cancellation(task_id)
+                                                video = future_to_video[future]
+                                                try:
+                                                    future.result()
+                                                except TaskCanceledException:
+                                                    logging.warning(f"Task {task_id} has been canceled during processing video {video}.")
+                                                    return
+                                                except Exception as e:
+                                                    logging.error(f"Error processing video {video}: {e}")
+                                                    socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                                finally:
+                                                    processed_videos += 1
+                                                    pbar.update(1)
+
+                                                    current_time = time.time()
+                                                    if current_time - last_update_time >= 1:
+                                                        socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
+                                                        last_update_time = current_time
+
+                                    elif ad_format == 'Carousel':
+                                        create_carousel_ad(ad_set.get_id(), video_files, config, task_id)
+
+                        else:
+                            video_files = get_all_video_files(folder_path)
+                            if not video_files:
                                 continue
 
-                            ad_set = create_ad_set(campaign_id, subfolder, config, task_id)
+                            ad_set = create_ad_set(campaign_id, folder, video_files, config, task_id)
                             if not ad_set:
                                 continue
 
                             if ad_format == 'Single image or video':
                                 with ThreadPoolExecutor(max_workers=10) as executor:
-                                    future_to_media = {
-                                        executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media 
-                                        for media in media_items
-                                    }
-                                    for future in as_completed(future_to_media):
-                                        check_cancellation(task_id)
-                                        media_item = future_to_media[future]
+                                    future_to_video = {executor.submit(create_ad, ad_set.get_id(), video, config, task_id): video for video in video_files}
 
+                                    for future in as_completed(future_to_video):
+                                        check_cancellation(task_id)
+                                        video = future_to_video[future]
                                         try:
                                             future.result()
                                         except TaskCanceledException:
-                                            logging.warning(f"Task {task_id} has been canceled during processing {media_item['media_file']}.")
+                                            logging.warning(f"Task {task_id} has been canceled during processing video {video}.")
                                             return
                                         except Exception as e:
-                                            logging.error(f"Error processing {media_item['media_file']}: {e}")
+                                            logging.error(f"Error processing video {video}: {e}")
                                             socketio.emit('error', {'task_id': task_id, 'message': str(e)})
                                         finally:
                                             processed_videos += 1
                                             pbar.update(1)
 
                                             current_time = time.time()
-                                            if current_time - last_update_time >= 1:
-                                                socketio.emit('progress', {
-                                                    'task_id': task_id, 
-                                                    'progress': processed_videos / total * 100, 
-                                                    'step': f"{processed_videos}/{total}"
-                                                })
+                                            if current_time - last_update_time >= 0.5:
+                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total_videos * 100, 'step': f"{processed_videos}/{total_videos}"})
                                                 last_update_time = current_time
 
                             elif ad_format == 'Carousel':
-                                create_carousel_ad(ad_set.get_id(), media_items, config, task_id)
-
-                    else:
-                        if subfolder_mapping:
-                            folder, media_items = next(iter(subfolder_mapping.items()))
-                        else:
-                            folder, media_items = None, []
-
-                        if not media_items:
-                            return
-
-                        ad_set = create_ad_set(campaign_id, folder, config, task_id)
-                        if not ad_set:
-                            return
-
-                        if ad_format == 'Single image or video':
-                            with ThreadPoolExecutor(max_workers=10) as executor:
-                                future_to_media = {
-                                    executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media 
-                                    for media in media_items
-                                }
-                                for future in as_completed(future_to_media):
-                                    check_cancellation(task_id)
-                                    media_item = future_to_media[future]
-
-                                    try:
-                                        future.result()
-                                    except TaskCanceledException:
-                                        logging.warning(f"Task {task_id} has been canceled during processing {media_item['media_file']}.")
-                                        return
-                                    except Exception as e:
-                                        logging.error(f"Error processing {media_item['media_file']}: {e}")
-                                        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
-                                    finally:
-                                        processed_videos += 1
-                                        pbar.update(1)
-
-                                        current_time = time.time()
-                                        if current_time - last_update_time >= 0.5:
-                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_videos / total * 100, 'step': f"{processed_videos}/{total}"})
-                                            last_update_time = current_time
-
-                        elif ad_format == 'Carousel':
-                            create_carousel_ad(ad_set.get_id(), media_items, config, task_id)
+                                create_carousel_ad(ad_set.get_id(), video_files, config, task_id)
 
                 socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_videos}/{total_videos}"})
                 socketio.emit('task_complete', {'task_id': task_id})
@@ -1045,8 +1162,223 @@ def handle_create_campaign():
             finally:
                 with tasks_lock:
                     process_pids.pop(task_id, None)
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
-        socketio.start_background_task(target=process_media, task_id=task_id, campaign_id=campaign_id, folder_structure=folder_structure, config=config, total=total)
+        def process_images(task_id, campaign_id, folders, config, total_images):
+            try:
+                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_images}"})
+                processed_images = 0
+
+                with tqdm(total=total_images, desc="Processing images") as pbar:
+                    last_update_time = time.time()
+                    for folder in folders:
+                        check_cancellation(task_id)
+                        folder_path = os.path.join(temp_dir, folder)
+
+                        if has_subfolders(folder_path):
+                            for subfolder in os.listdir(folder_path):
+                                subfolder_path = os.path.join(folder_path, subfolder)
+                                if os.path.isdir(subfolder_path):
+                                    image_files = get_all_image_files(subfolder_path)
+                                    if not image_files:
+                                        continue
+
+                                    ad_set = create_ad_set(campaign_id, subfolder, image_files, config, task_id)
+                                    if not ad_set:
+                                        continue
+
+                                    if config['ad_format'] == 'Single image or video':
+                                        with ThreadPoolExecutor(max_workers=10) as executor:
+                                            future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+
+                                            for future in as_completed(future_to_image):
+                                                check_cancellation(task_id)
+                                                image = future_to_image[future]
+                                                try:
+                                                    future.result()
+                                                except TaskCanceledException:
+                                                    logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                                    return
+                                                except Exception as e:
+                                                    logging.error(f"Error processing image {image}: {e}")
+                                                    socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                                finally:
+                                                    processed_images += 1
+                                                    pbar.update(1)
+
+                                                    current_time = time.time()
+                                                    if current_time - last_update_time >= 1:
+                                                        socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                                        last_update_time = current_time
+
+                                    elif config['ad_format'] == 'Carousel':
+                                        create_carousel_ad(ad_set.get_id(), image_files, config, task_id)
+
+                        else:
+                            image_files = get_all_image_files(folder_path)
+                            if not image_files:
+                                continue
+
+                            ad_set = create_ad_set(campaign_id, folder, image_files, config, task_id)
+                            if not ad_set:
+                                continue
+
+                            if config['ad_format'] == 'Single image or video':
+                                with ThreadPoolExecutor(max_workers=10) as executor:
+                                    future_to_image = {executor.submit(create_ad, ad_set.get_id(), image, config, task_id): image for image in image_files}
+
+                                    for future in as_completed(future_to_image):
+                                        check_cancellation(task_id)
+                                        image = future_to_image[future]
+                                        try:
+                                            future.result()
+                                        except TaskCanceledException:
+                                            logging.warning(f"Task {task_id} has been canceled during processing image {image}.")
+                                            return
+                                        except Exception as e:
+                                            logging.error(f"Error processing image {image}: {e}")
+                                            socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                        finally:
+                                            processed_images += 1
+                                            pbar.update(1)
+
+                                            current_time = time.time()
+                                            if current_time - last_update_time >= 0.5:
+                                                socketio.emit('progress', {'task_id': task_id, 'progress': processed_images / total_images * 100, 'step': f"{processed_images}/{total_images}"})
+                                                last_update_time = current_time
+
+                            elif config['ad_format'] == 'Carousel':
+                                create_carousel_ad(ad_set.get_id(), image_files, config, task_id)
+
+                socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_images}/{total_images}"})
+                socketio.emit('task_complete', {'task_id': task_id})
+            except TaskCanceledException:
+                logging.warning(f"Task {task_id} has been canceled during image processing.")
+            except Exception as e:
+                logging.error(f"Error in processing images: {e}")
+                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            finally:
+                with tasks_lock:
+                    process_pids.pop(task_id, None)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        def process_mixed_media(task_id, campaign_id, folders, config, total_videos, total_images):
+            try:
+                total_files = total_videos + total_images
+                socketio.emit('progress', {'task_id': task_id, 'progress': 0, 'step': f"0/{total_files}"})
+                processed_files = 0
+
+                with tqdm(total=total_files, desc="Processing mixed media") as pbar:
+                    last_update_time = time.time()
+                    for folder in folders:
+                        check_cancellation(task_id)
+                        folder_path = os.path.join(temp_dir, folder)
+
+                        # Check if the folder contains subfolders
+                        if has_subfolders(folder_path):
+                            for subfolder in os.listdir(folder_path):
+                                subfolder_path = os.path.join(folder_path, subfolder)
+                                if os.path.isdir(subfolder_path):
+                                    video_files = get_all_video_files(subfolder_path)
+                                    image_files = get_all_image_files(subfolder_path)
+                                    media_files = video_files + image_files
+
+                                    if media_files:
+                                        # Create an ad set for each subfolder
+                                        ad_set = create_ad_set(campaign_id, subfolder, media_files, config, task_id)
+                                        if not ad_set:
+                                            continue
+
+                                        if config['ad_format'] == 'Single image or video':
+                                            with ThreadPoolExecutor(max_workers=10) as executor:
+                                                future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
+
+                                                for future in as_completed(future_to_media):
+                                                    check_cancellation(task_id)
+                                                    media = future_to_media[future]
+                                                    try:
+                                                        future.result()
+                                                    except TaskCanceledException:
+                                                        logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
+                                                        return
+                                                    except Exception as e:
+                                                        logging.error(f"Error processing media {media}: {e}")
+                                                        socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                                    finally:
+                                                        processed_files += 1
+                                                        pbar.update(1)
+
+                                                        current_time = time.time()
+                                                        if current_time - last_update_time >= 0.5:
+                                                            socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
+                                                            last_update_time = current_time
+
+                                        elif config['ad_format'] == 'Carousel':
+                                            create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
+
+                        else:
+                            # Process the folder if no subfolders exist
+                            video_files = get_all_video_files(folder_path)
+                            image_files = get_all_image_files(folder_path)
+                            media_files = video_files + image_files
+
+                            if media_files:
+                                # Create an ad set for the folder
+                                ad_set = create_ad_set(campaign_id, folder, media_files, config, task_id)
+                                if not ad_set:
+                                    continue
+
+                                if config['ad_format'] == 'Single image or video':
+                                    with ThreadPoolExecutor(max_workers=10) as executor:
+                                        future_to_media = {executor.submit(create_ad, ad_set.get_id(), media, config, task_id): media for media in media_files}
+
+                                        for future in as_completed(future_to_media):
+                                            check_cancellation(task_id)
+                                            media = future_to_media[future]
+                                            try:
+                                                future.result()
+                                            except TaskCanceledException:
+                                                logging.warning(f"Task {task_id} has been canceled during processing media {media}.")
+                                                return
+                                            except Exception as e:
+                                                logging.error(f"Error processing media {media}: {e}")
+                                                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+                                            finally:
+                                                processed_files += 1
+                                                pbar.update(1)
+
+                                                current_time = time.time()
+                                                if current_time - last_update_time >= 0.5:
+                                                    socketio.emit('progress', {'task_id': task_id, 'progress': processed_files / total_files * 100, 'step': f"{processed_files}/{total_files}"})
+                                                    last_update_time = current_time
+
+                                elif config['ad_format'] == 'Carousel':
+                                    create_carousel_ad(ad_set.get_id(), media_files, config, task_id)
+
+                socketio.emit('progress', {'task_id': task_id, 'progress': 100, 'step': f"{total_files}/{total_files}"})
+                socketio.emit('task_complete', {'task_id': task_id})
+
+            except TaskCanceledException:
+                logging.warning(f"Task {task_id} has been canceled during mixed media processing.")
+            except Exception as e:
+                logging.error(f"Error in processing mixed media: {e}")
+                socketio.emit('error', {'task_id': task_id, 'message': str(e)})
+            finally:
+                with tasks_lock:
+                    process_pids.pop(task_id, None)
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        
+        
+
+
+        # Call the appropriate processing function based on media types
+        if total_videos > 0 and total_images > 0:
+            socketio.start_background_task(target=process_mixed_media, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos, total_images=total_images)
+        elif total_videos > 0:
+            socketio.start_background_task(target=process_videos, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_videos=total_videos)
+        elif total_images > 0:
+            socketio.start_background_task(target=process_images, task_id=task_id, campaign_id=campaign_id, folders=folders, config=config, total_images=total_images)
 
         return jsonify({"message": "Campaign processing started", "task_id": task_id})
 
@@ -1077,31 +1409,7 @@ def cancel_task():
     except Exception as e:
         print(f"Error handling cancel task request: {e}")
         return jsonify({"error": "Internal server error"}), 500
-    
-@app.route('/get_campaign_budget_optimization', methods=['POST'])
-def handle_get_campaign_budget_optimization():
-    try:
-        data = request.json        
-        campaign_id = data.get('campaign_id')
-        ad_account_id = data.get('ad_account_id')
-        app_id = data.get('app_id')
-        app_secret = data.get('app_secret')
-        access_token = data.get('access_token')
 
-        if not campaign_id or not ad_account_id or not app_id or not app_secret or not access_token:
-            return jsonify({"error": "Campaign ID, Ad Account ID, App ID, App Secret, and Access Token are required"}), 400
 
-        FacebookAdsApi.init(app_id, app_secret, access_token, api_version='v19.0')
-        campaign_budget_optimization = is_campaign_budget_optimized(campaign_id, ad_account_id)
-
-        if campaign_budget_optimization is not None:
-            return jsonify({"campaign_budget_optimization": campaign_budget_optimization}), 200
-        else:
-            return jsonify({"error": "Failed to retrieve campaign budget optimization details"}), 500
-
-    except Exception as e:
-        logging.error(f"Error in handle_get_campaign_budget_optimization: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-    
 if __name__ == "__main__":
     socketio.run(app, debug=True, host='0.0.0.0',port=5001)
