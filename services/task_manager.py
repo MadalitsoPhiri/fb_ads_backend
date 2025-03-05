@@ -14,6 +14,21 @@ class TaskCanceledException(Exception):
     """Custom exception raised when a task is canceled."""
     pass
 
+def add_task(task_id):
+    """
+    Adds a task to the upload tracking list.
+
+    Args:
+        task_id (str): Unique identifier for the task.
+    """
+    with tasks_lock:
+        if task_id in upload_tasks:
+            logging.warning(f"Task {task_id} already exists.")
+        else:
+            upload_tasks[task_id] = True
+            process_pids[task_id] = []
+            logging.info(f"Task {task_id} added successfully.")
+
 def check_cancellation(task_id):
     """
     Checks if a task has been marked for cancellation.
