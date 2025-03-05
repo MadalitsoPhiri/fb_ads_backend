@@ -92,3 +92,33 @@ def cancel_task(task_id):
         logging.error(f"Error while canceling task {task_id}: {e}")
         emit_error(f"Error canceling task {task_id}: {e}", task_id)
         return {"error": "Failed to cancel task due to internal error."}
+
+def cleanup_task_pid(task_id):
+    """
+    Removes process PIDs of a completed task.
+    If the associated PIDs are no longer active, the task is removed from `process_pids`.
+    
+    Args:
+        task_id (str): The unique identifier of the task.
+    """
+    with tasks_lock:
+        if task_id not in process_pids:
+            logging.warning(f"Task {task_id} not found in process tracking.")
+            return
+
+        active_pids = []
+        for pid in process_pids[task_id]:
+            try:
+                os.kill(pid, 0)  # Check if process is still running (no signal sent)
+                active_pids.append(pid)  # Keep running PIDs
+            except OSError:
+                logging.info(f"Process {pid} for task {task_id} has completed and will be removed.")
+
+        if not active_pids:
+            # If no active PIDs remain, remove task from tracking
+            process_pids.pop(task_id, None)
+            upload_tasks.pop(task_id, None)
+            logging.info(f"Task {task_id} has been fully completed and removed from tracking.")
+        else:
+            # Update with only active PIDs
+            process_pids[task_id] = active_pids

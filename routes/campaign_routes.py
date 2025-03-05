@@ -15,6 +15,7 @@ from services.campaign_service import (
     get_campaign_budget_optimization, 
     create_campaign
 )
+from services.media_processing_service  import process_media
 
 # Utilities
 from utils.validators import validate_campaign_request
@@ -71,6 +72,7 @@ def handle_get_campaign_budget_optimization():
 @campaign_bp.route('/create_campaign', methods=['POST'])
 def handle_create_campaign():
     try:
+        # Validate request
         is_valid, response, status_code = validate_campaign_request()
         if not is_valid:
             return response, status_code
@@ -83,22 +85,25 @@ def handle_create_campaign():
         # Add task using Task Manager
         add_task(config["task_id"])
 
-        # Check if a campaign ID is provided, otherwise create a new campaign
-        if config.get("campaign_id"):
+        # Determine campaign ID (existing or new)
+        campaign_id = config.get("campaign_id")
+        if campaign_id:
             campaign_id = find_campaign_by_id(config)
             if not campaign_id:
                 logging.error(f"Campaign ID {config['campaign_id']} not found for ad account {config['ad_account_id']}")
                 return jsonify({"error": "Campaign ID not found"}), 404
 
+            # Check if existing campaign has budget optimization
             existing_campaign_budget_optimization = get_campaign_budget_optimization(config)
             config['is_existing_cbo'] = existing_campaign_budget_optimization.get('is_campaign_budget_optimization', False)
         else:
-            # Create a new campaign using structured data
+            # Create a new campaign
             campaign_id, campaign = create_campaign(config)
             if not campaign_id:
                 logging.error(f"Failed to create campaign with name {config['campaign_name']}")
                 return jsonify({"error": "Failed to create campaign"}), 500
 
+        # Create a temporary directory
         temp_dir = Path(tempfile.mkdtemp())
 
         # Save uploaded files
@@ -107,13 +112,23 @@ def handle_create_campaign():
         # Get all subfolders
         folders = get_subfolders(temp_dir)
 
+        # Get total media count
         total_media = sum(len(get_all_files(folder)) for folder in folders)
-        
-        # Call the appropriate processing function based on media types
-        get_socketio.start_background_task(target=process_media, task_id=config["task_id"], campaign_id=campaign_id, folders=folders, config=config, total_media=total_media)
+
+        # Start processing media in the background
+        get_socketio().start_background_task(
+            target=process_media, 
+            task_id=config["task_id"], 
+            campaign_id=campaign_id, 
+            folders=folders, 
+            config=config, 
+            total_media=total_media,
+            temp_dir=temp_dir
+        )
 
         return jsonify({"message": "Campaign processing started", "task_id": config["task_id"]})
 
     except Exception as e:
         logging.error(f"Error in handle_create_campaign: {e}")
+        emit_error(f"Error in handle_create_campaign: {e}")
         return jsonify({"error": "Internal server error"}), 500
