@@ -3,8 +3,7 @@ import tempfile
 from pathlib import Path
 
 # Flask-related imports
-from flask import Blueprint, request, jsonify
-
+from flask import Blueprint, request, jsonify, current_app
 
 # Services
 from services import is_campaign_budget_optimized
@@ -20,11 +19,10 @@ from services.media_processing_service  import process_media
 # Utilities
 from utils.validators import validate_campaign_request
 from utils.error_handler import emit_error
-from utils.get_socket import get_socketio
 from services.file_service import (
     save_uploaded_files,
     get_subfolders,
-    get_all_files
+    get_total_media_count,
 )
 
 # Create a Blueprint for campaign-related routes
@@ -113,18 +111,11 @@ def handle_create_campaign():
         folders = get_subfolders(temp_dir)
 
         # Get total media count
-        total_media = sum(len(get_all_files(folder)) for folder in folders)
+        total_media = total_media = get_total_media_count(temp_dir)
+        logging.info(f"Total media files found: {total_media}")  # Add this line
 
-        # Start processing media in the background
-        get_socketio().start_background_task(
-            target=process_media, 
-            task_id=config["task_id"], 
-            campaign_id=campaign_id, 
-            folders=folders, 
-            config=config, 
-            total_media=total_media,
-            temp_dir=temp_dir
-        )
+        app = current_app._get_current_object()
+        process_media( app, config["task_id"], campaign_id, folders, config, total_media, temp_dir )
 
         return jsonify({"message": "Campaign processing started", "task_id": config["task_id"]})
 

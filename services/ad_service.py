@@ -11,14 +11,14 @@ from services.task_manager import check_cancellation, TaskCanceledException
 from services.upload_service import upload_image, upload_video
 from utils.error_handler import emit_error
 
-def create_ad(ad_set_id, media_file, config, task_id):
+def create_ad(app, ad_set_id, media_file, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Single image or video')
         if ad_format == 'Single image or video':
-            if media_file["media_file"].lower().endswith(('.jpg', '.png', '.jpeg', '.webp')):
+            if media_file.lower().endswith(('.jpg', '.png', '.jpeg', '.webp')):
                 # Image ad logic
-                image_hash = upload_image(media_file, task_id, config)
+                image_hash = upload_image(app, media_file, task_id, config)
                 if not image_hash:
                     print(f"Failed to upload image: {media_file}")
                     return
@@ -84,7 +84,7 @@ def create_ad(ad_set_id, media_file, config, task_id):
                 # Video ad logic
                 video_path = media_file
 
-                video_id, image_hash = upload_video(video_path, task_id, config)
+                video_id, image_hash = upload_video(app, video_path, task_id, config)
                 if not video_id:
                     print(f"Failed to upload video: {media_file}")
                     return
@@ -160,7 +160,7 @@ def create_ad(ad_set_id, media_file, config, task_id):
             error_msg = f"Error creating ad: {e}"
             emit_error(task_id, error_msg)
 
-def create_carousel_ad(ad_set_id, media_files, config, task_id):
+def create_carousel_ad(app, ad_set_id, media_files, config, task_id):
     check_cancellation(task_id)
     try:
         ad_format = config.get('ad_format', 'Carousel')
@@ -171,7 +171,7 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
                 if media_file.lower().endswith(('.mp4', '.mov', '.avi')):
                     # Video processing
                     video_path = media_file
-                    video_id, image_hash = upload_video(video_path, task_id, config)
+                    video_id, image_hash = upload_video(app, video_path, task_id, config)
 
                     if not video_id:
                         print(f"Failed to upload video: {media_file}")
@@ -196,7 +196,7 @@ def create_carousel_ad(ad_set_id, media_files, config, task_id):
 
                 elif media_file.lower().endswith(('.jpg', '.jpeg', '.png')):
                     # Image processing
-                    image_hash = upload_image(media_file, task_id, config)
+                    image_hash = upload_image(app, media_file, task_id, config)
                     if not image_hash:
                         print(f"Failed to upload image: {media_file}")
                         return

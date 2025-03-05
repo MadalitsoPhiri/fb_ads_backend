@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from services import cancel_task
 
-task_bp = Blueprint("task_bp", __name__)
+task_bp = Blueprint("tasks", __name__)
 
 @task_bp.route("/cancel_task", methods=["POST"])
 def cancel_task_route():

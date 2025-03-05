@@ -41,7 +41,7 @@ def create_campaign(data):
 
         # Define basic campaign parameters
         campaign_params = {
-            "name": data["name"],
+            "name": data["campaign_name"],
             "objective": data["objective"],
             "special_ad_categories": ["NONE"],  # Modify this based on actual categories if necessary
             "buying_type": data["buying_type"],

@@ -1,6 +1,8 @@
 import logging
 import shutil
 from pathlib import Path
+import glob
+import os
 
 # Supported file extensions
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
@@ -13,7 +15,13 @@ def get_files(directory, extensions):
     if not directory.exists():
         logging.warning(f"Directory not found: {directory}")
         return []
-    return [str(file) for file in directory.rglob("*") if file.suffix.lower() in extensions]
+    
+    files = [
+        str(file) for file in directory.rglob("*")
+        if file.suffix.lower() in extensions and Path(file).name.lower() != ".ds_store"
+    ]
+    logging.info(f"Found {len(files)} files in {directory}")
+    return files
 
 def get_all_video_files(directory):
     """Wrapper for retrieving video files."""
@@ -27,6 +35,26 @@ def get_all_files(directory):
     """Wrapper for retrieving both image and video files."""
     return get_files(directory, MEDIA_EXTENSIONS)
 
+def get_total_media_count(directory):
+    """
+    Returns the total number of media files (images & videos) in a directory,
+    including files in subdirectories.
+
+    Args:
+        directory (str or Path): The root directory to scan.
+
+    Returns:
+        int: Total count of media files found.
+    """
+    directory = Path(directory)
+    if not directory.exists():
+        logging.warning(f"Directory does not exist: {directory}")
+        return 0
+
+    media_files = get_files(directory, MEDIA_EXTENSIONS)
+    logging.info(f"Total media files found in {directory}: {len(media_files)}")
+
+    return len(media_files)
 
 def clean_temp_files(directory):
     """Deletes the specified directory and its contents."""
@@ -45,7 +73,7 @@ def clean_temp_files(directory):
 
 def save_uploaded_files(upload_folder, destination):
     """
-    Saves uploaded files to a specified directory while skipping hidden files.
+    Saves uploaded files to a specified directory while preserving folder structure.
 
     Args:
         upload_folder (list): List of uploaded file objects.
@@ -57,10 +85,22 @@ def save_uploaded_files(upload_folder, destination):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
 
+    logging.info(f"Saving uploaded files to: {destination}")
+
     for file in upload_folder:
-        if not file.filename.startswith('.') or file.filename.lower() in ['.ds_store', 'thumbs.db']:  # Skip hidden files
-            file_path = destination / file.filename
-            file.save(str(file_path))
+        file_name = Path(file.filename).name
+        if file_name.startswith('.') or file_name.lower() in [".ds_store", "thumbs.db"]:
+            continue  # Skip hidden files
+        parent_folder = Path(file.filename).parent  # Get subfolder name if any
+        
+        # Create a subdirectory for the file
+        file_dest_dir = destination / parent_folder
+        file_dest_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = file_dest_dir / file_name
+        file.save(str(file_path))
+
+        logging.info(f"File saved: {file_path}")
 
 def get_subfolders(directory):
     """

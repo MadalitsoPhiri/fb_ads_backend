@@ -84,7 +84,7 @@ def cancel_task(task_id):
                 logging.info(f"Task {task_id} successfully marked for cancellation.")
 
             # Notify the frontend via SocketIO that the task was canceled
-            emit_error(f"Task {task_id} has been canceled.", task_id)
+            # emit_error(f"Task {task_id} has been canceled.", task_id)
 
         return {"message": f"Task {task_id} has been canceled."}
 

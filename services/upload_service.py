@@ -74,49 +74,73 @@ def poll_video_status(video_id, access_token, timeout=600, poll_interval=5):
     print(f"⚠️ Video {video_id} did not finish processing within {timeout} seconds.")
     return False
 
-def upload_video(video_file, task_id, config):
+def upload_video(app, video_file, task_id, config):
     """Uploads a video, extracts its first frame as a thumbnail, and uploads the thumbnail."""
-    try:
-        check_cancellation(task_id)
-        video = AdVideo(parent_id=config['ad_account_id'])
-        video[AdVideo.Field.filepath] = video_file
-        video.remote_create()
-        video_id = video.get_id()
 
-        if not video_id:
-            print("Failed to upload video")
+    with app.app_context():  
+        try:
+            check_cancellation(task_id)
+            video = AdVideo(parent_id=config['ad_account_id'])
+            video[AdVideo.Field.filepath] = video_file
+            video.remote_create()
+            video_id = video.get_id()
+
+            if not video_id:
+                print("Failed to upload video")
+                return None, None
+
+            print(f"⏳ Video {video_id} uploaded. Waiting for processing to complete...")
+
+            # Polling for video processing completion
+            success = poll_video_status(video_id, config['access_token'])
+
+            # Extract and upload the thumbnail
+            thumbnail_hash = None
+            thumbnail_path = extract_thumbnail(video_file)
+            if thumbnail_path:
+                thumbnail_hash = upload_image(app, thumbnail_path, task_id, config)
+
+            if success:
+                print(f"✅ Video {video_id} is fully processed and ready to use.")
+                return video_id, thumbnail_hash
+            else:
+                print(f"⚠️ Video {video_id} failed to process in time.")
+                return None, None
+        except Exception as e:
+            emit_error(f"Error uploading video: {e}")
             return None, None
-
-        print(f"⏳ Video {video_id} uploaded. Waiting for processing to complete...")
-
-        # Polling for video processing completion
-        success = poll_video_status(video_id, config['access_token'])
-
-        # Extract and upload the thumbnail
-        thumbnail_hash = None
-        thumbnail_path = extract_thumbnail(video_file)
-        if thumbnail_path:
-            thumbnail_hash = upload_image(thumbnail_path, config['ad_account_id'])
-
-        if success:
-            print(f"✅ Video {video_id} is fully processed and ready to use.")
-            return video_id, thumbnail_hash
-        else:
-            print(f"⚠️ Video {video_id} failed to process in time.")
-            return None, None
-    except Exception as e:
-        emit_error(f"Error uploading video: {e}")
-        return None, None
     
-def upload_image(image_file, task_id, config):
-    check_cancellation(task_id)
-    try:
-        image = AdImage(parent_id=config['ad_account_id'])
-        image[AdImage.Field.filename] = image_file
-        image.remote_create()
-        logging.info(f"Uploaded image with hash: {image[AdImage.Field.hash]}")
-        return image[AdImage.Field.hash]
+def upload_image(app, image_file, task_id, config):
+    with app.app_context():  
 
-    except Exception as e:
-        emit_error(f"Error uploading image: {e}")
-        return None
+        check_cancellation(task_id)
+        
+        # Convert WebP to JPEG if necessary
+        if image_file.lower().endswith(".webp"):
+            try:
+                image_file = convert_webp_to_jpeg(image_file)
+                logging.info(f"Converted WebP to JPEG: {image_file}")
+            except Exception as e:
+                emit_error(f"Error converting WebP to JPEG: {e}")
+                return None
+
+        try:
+            image = AdImage(parent_id=config['ad_account_id'])
+            image[AdImage.Field.filename] = image_file
+            image.remote_create()
+
+            # Correct way to get the hash value
+            image_hash = image.get(AdImage.Field.hash)
+
+            if not image_hash:
+                logging.error("Error: Response does not contain image hash!")
+                return None
+
+            logging.info(f"Uploaded image with hash: {image_hash}")
+            return image_hash
+
+        except Exception as e:
+            emit_error(f"Error uploading image: {e}")
+            return None
+
+

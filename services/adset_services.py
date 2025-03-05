@@ -71,7 +71,7 @@ def create_ad_set(campaign_id, folder_name, config, task_id):
                 "targeting_optimization_type": "TARGETING_OPTIMIZATION_ADVANTAGE_PLUS",
                 # Add any other fields required for Advantage+ targeting
                 "targeting": {
-                    "geo_locations": {"countries": [config["location"]]},
+                    "geo_locations": {"countries": [config["geo_locations"]]},
                 },
                 "start_time": start_time.strftime('%Y-%m-%dT%H:%M:%S'),
                 "dynamic_ad_image_enhancement": True,  # Example: enabling dynamic enhancements
@@ -151,7 +151,7 @@ def create_ad_set(campaign_id, folder_name, config, task_id):
                 "billing_event": "IMPRESSIONS",
                 "optimization_goal": config.get("optimization_goal", "OFFSITE_CONVERSIONS"),  # Use the optimization goal from config
                 "targeting": {
-                    "geo_locations": {"countries": config["location"]},  # Updated to support multiple countries
+                    "geo_locations": {"countries": config["geo_locations"]},  # Updated to support multiple countries
                     "age_min": age_min,
                     "age_max": age_max,
                     "genders": gender_value,
