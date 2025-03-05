@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta
 
 from utils.error_handler import emit_error  
-from task_manager import check_cancellation
+from services.task_manager import check_cancellation
 from utils.facebook_client import FacebookAdsClient
 from utils.json_parser import parse_custom_audiences
 from utils.validators import validate_json_payload
