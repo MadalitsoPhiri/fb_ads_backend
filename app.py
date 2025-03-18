@@ -22,7 +22,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Initialize SocketIO for WebSocket support
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="http://localhost:3000")
 
 # Store SocketIO instance in Flask extensions for easy access in other modules
 app.extensions['socketio'] = socketio
@@ -31,14 +31,6 @@ app.extensions['socketio'] = socketio
 app.register_blueprint(campaign_bp, url_prefix='/campaigns')  # Routes related to campaign management
 app.register_blueprint(task_bp, url_prefix='/tasks')  # Routes related to task handling
 
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "http://localhost/3000" # <- You can change "*" for a domain for example "http://localhost"
-    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS, PUT, DELETE"
-    response.headers["Access-Control-Allow-Headers"] = "Accept, Content-Type, Origin"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
-# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,  # Ensure DEBUG messages are shown
     format="%(asctime)s - %(levelname)s - %(message)s",
