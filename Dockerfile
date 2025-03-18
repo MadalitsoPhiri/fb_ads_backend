@@ -15,6 +15,5 @@ RUN apt-get update && apt-get install -y ffmpeg && apt-get clean
 
 # Make port 5001 available to the world outside this container
 EXPOSE 5001
-
 # Run the Flask app on port 5001
-CMD ["python", "app.py", "--host=0.0.0.0", "--port=5001"]
+CMD ["gunicorn","-b","0.0.0.0:5000","-w","10","app:app"]
